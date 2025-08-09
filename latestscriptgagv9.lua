@@ -1,21 +1,22 @@
--- TOCHIPYRO Script (Grow a Garden) with persistent pet enlargement in all slots, including Garden
+-- TOCHIPYRO Script (Grow a Garden) with persistent pet enlargement
+
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 local workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
 
 local ENLARGE_SCALE = 1.75
 
--- Containers to monitor for pet spawns (added GardenSlot support)
+-- Containers to monitor for pet spawns
 local petContainers = {
     workspace,
     workspace:FindFirstChild("Pets"),
     workspace:FindFirstChild("PetSlots"),
-    workspace:FindFirstChild("GardenSlot"), -- garden slot singular
-    workspace:FindFirstChild("GardenSlots"), -- garden slot plural
+    workspace:FindFirstChild("GardenSlot"), -- ✅ Add Garden Slot
+    workspace:FindFirstChild("GardenSlots"), -- ✅ In case it's plural
     LocalPlayer.Character,
     LocalPlayer:FindFirstChild("Backpack"),
 }
-
 local enlargedPetIds = {}
 
 -- Rainbow color helper
@@ -64,12 +65,12 @@ local function onPetAdded(pet)
     end
 end
 
--- Connect listeners to all pet containers and enlarge existing ones
+-- Connect listeners to all pet containers
 for _, container in ipairs(petContainers) do
     if container then
         container.ChildAdded:Connect(onPetAdded)
         for _, child in ipairs(container:GetChildren()) do
-            onPetAdded(child)
+            onPetAdded(child) -- enlarge existing pets too
         end
     end
 end
@@ -99,6 +100,7 @@ local function enlargeCurrentHeldPet()
 end
 
 -- GUI Creation
+
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "TOCHIPYRO_Script"
 ScreenGui.Parent = game.CoreGui
@@ -193,3 +195,5 @@ end)
 BypassButton.MouseButton1Click:Connect(function()
     print("[TOCHIPYRO] Bypass pressed (placeholder).")
 end)
+
+
