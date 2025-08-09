@@ -15,38 +15,7 @@ local petContainers = {
     workspace:FindFirstChild("PetSlots"),
     workspace:FindFirstChild("GardenSlots"), -- Added garden slots
 }
--- Special monitoring for GardenSlots so pets stay big there
-local gardenSlots = workspace:FindFirstChild("GardenSlots")
-if gardenSlots then
-    gardenSlots.ChildAdded:Connect(function(slot)
-        -- Each slot might contain the pet model as a descendant
-        slot.DescendantAdded:Connect(function(descendant)
-            if descendant:IsA("Model") and descendant:FindFirstChildWhichIsA("BasePart") then
-                local id = getPetUniqueId(descendant)
-                if id and enlargedPetIds[id] then
-                    task.wait(0.1) -- let it load fully
-                    scaleModelWithJoints(descendant, ENLARGE_SCALE)
-                    descendant:SetAttribute("TOCHIPYRO_Enlarged", true)
-                    print("[TOCHIPYRO] Pet placed in garden enlarged again:", descendant.Name)
-                end
-            end
-        end)
-    end)
 
-    -- Also check existing pets in garden at script start
-    for _, slot in ipairs(gardenSlots:GetChildren()) do
-        for _, obj in ipairs(slot:GetDescendants()) do
-            if obj:IsA("Model") and obj:FindFirstChildWhichIsA("BasePart") then
-                local id = getPetUniqueId(obj)
-                if id and enlargedPetIds[id] then
-                    scaleModelWithJoints(obj, ENLARGE_SCALE)
-                    obj:SetAttribute("TOCHIPYRO_Enlarged", true)
-                    print("[TOCHIPYRO] Enlarged existing garden pet:", obj.Name)
-                end
-            end
-        end
-    end
-end
 
 local enlargedPetIds = {}
 local petConnections = {}
@@ -232,19 +201,37 @@ local function getHeldPet()
         end
     end
     
-    -- Check garden slots if available
-    local gardenSlots = workspace:FindFirstChild("GardenSlots")
-    if gardenSlots then
-        for _, slot in ipairs(gardenSlots:GetChildren()) do
-            for _, obj in ipairs(slot:GetDescendants()) do
-                if obj:IsA("Model") and obj:FindFirstChildWhichIsA("BasePart") and obj:GetAttribute("Owner") == LocalPlayer.Name then
-                    return obj
+ -- Special monitoring for GardenSlots so pets stay big there
+local gardenSlots = workspace:FindFirstChild("GardenSlots")
+if gardenSlots then
+    gardenSlots.ChildAdded:Connect(function(slot)
+        -- Each slot might contain the pet model as a descendant
+        slot.DescendantAdded:Connect(function(descendant)
+            if descendant:IsA("Model") and descendant:FindFirstChildWhichIsA("BasePart") then
+                local id = getPetUniqueId(descendant)
+                if id and enlargedPetIds[id] then
+                    task.wait(0.1) -- let it load fully
+                    scaleModelWithJoints(descendant, ENLARGE_SCALE)
+                    descendant:SetAttribute("TOCHIPYRO_Enlarged", true)
+                    print("[TOCHIPYRO] Pet placed in garden enlarged again:", descendant.Name)
+                end
+            end
+        end)
+    end)
+
+    -- Also check existing pets in garden at script start
+    for _, slot in ipairs(gardenSlots:GetChildren()) do
+        for _, obj in ipairs(slot:GetDescendants()) do
+            if obj:IsA("Model") and obj:FindFirstChildWhichIsA("BasePart") then
+                local id = getPetUniqueId(obj)
+                if id and enlargedPetIds[id] then
+                    scaleModelWithJoints(obj, ENLARGE_SCALE)
+                    obj:SetAttribute("TOCHIPYRO_Enlarged", true)
+                    print("[TOCHIPYRO] Enlarged existing garden pet:", obj.Name)
                 end
             end
         end
     end
-    
-    return nil
 end
 
 -- Enhanced enlargement function
