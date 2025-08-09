@@ -1,199 +1,195 @@
--- TOCHIPYRO (robust) - persistent pet enlargement for garden plots
--- Put this into a LocalScript (StarterPlayerScripts / PlayerGui / etc.)
-
-local DEBUG = false               -- set true to see debug prints
-local CONTINUOUS_ENFORCE = false  -- set true only if server constantly resets sizes (heavy)
-
+-- TOCHIPYRO Script (Grow a Garden) with persistent pet enlargement in all slots, including Garden
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 local workspace = game:GetService("Workspace")
-local RunService = game:GetService("RunService")
 
 local ENLARGE_SCALE = 1.75
-local enlargedPetIds = {}                     -- persistent IDs you chose to enlarge
-local scaledModels = setmetatable({}, {__mode="k"}) -- weak keys for models already scaled
-local originalSizes = setmetatable({}, {__mode="k"}) -- store original sizes/scales for enforcement
 
-local function debugPrint(...)
-    if DEBUG then
-        print("[TOCHIPYRO DEBUG]", ...)
-    end
+-- Containers to monitor for pet spawns (added GardenSlot support)
+local petContainers = {
+    workspace,
+    workspace:FindFirstChild("Pets"),
+    workspace:FindFirstChild("PetSlots"),
+    workspace:FindFirstChild("GardenSlot"), -- garden slot singular
+    workspace:FindFirstChild("GardenSlots"), -- garden slot plural
+    LocalPlayer.Character,
+    LocalPlayer:FindFirstChild("Backpack"),
+}
+
+local enlargedPetIds = {}
+
+-- Rainbow color helper
+local function rainbowColor(t)
+    local hue = (tick() * 0.5 + t) % 1
+    return Color3.fromHSV(hue, 1, 1)
 end
 
--- Helper: identify a model from any instance (model or ancestor model)
-local function modelFromInstance(inst)
-    if not inst then return nil end
-    if inst:IsA("Model") then return inst end
-    return inst:FindFirstAncestorOfClass("Model")
-end
-
--- Heuristic: is this likely a pet model (has BasePart and no Humanoid)
-local function isLikelyPetModel(model)
-    if not model or not model:IsA("Model") then return false end
-    if model:FindFirstChildOfClass("Humanoid") then return false end
-    if model:FindFirstChildWhichIsA("BasePart") then return true end
-    return false
-end
-
--- Robust pet unique id extraction (tries many common attributes/Value objects, falls back to name)
-local function getPetUniqueId(petModel)
-    if not petModel then return nil end
-    local keys = {"PetID","PetUID","UUID","UniqueId","ID","Id","OwnerUserId","OwnerId"}
-    for _, k in ipairs(keys) do
-        local v = petModel:GetAttribute(k)
-        if v ~= nil then return tostring(v) end
-    end
-    -- scan for Value objects that contain id-ish names
-    for _, v in ipairs(petModel:GetDescendants()) do
-        if v:IsA("StringValue") or v:IsA("IntValue") or v:IsA("NumberValue") or v:IsA("ObjectValue") then
-            local n = v.Name:lower()
-            if n:find("pet") or n:find("id") or n:find("uid") or n:find("owner") then
-                if v.Value ~= nil then return tostring(v.Value) end
-            end
-        end
-    end
-    -- fallback to model name
-    return petModel.Name
-end
-
--- scale model parts & joints once per model (idempotent via scaledModels map)
+-- Scale model parts & joints preserving proportions
 local function scaleModelWithJoints(model, scaleFactor)
-    if not model or scaledModels[model] then return end
-    debugPrint("Scaling model:", model:GetFullName())
     for _, obj in ipairs(model:GetDescendants()) do
         if obj:IsA("BasePart") then
-            if not originalSizes[obj] then originalSizes[obj] = obj.Size end
             obj.Size = obj.Size * scaleFactor
         elseif obj:IsA("SpecialMesh") then
-            if not originalSizes[obj] then originalSizes[obj] = obj.Scale end
             obj.Scale = obj.Scale * scaleFactor
         elseif obj:IsA("Motor6D") then
-            -- scale just the position component, keep rotation
-            local p0 = obj.C0.Position
-            local r0 = obj.C0 - p0
-            obj.C0 = CFrame.new(p0 * scaleFactor) * r0
-            local p1 = obj.C1.Position
-            local r1 = obj.C1 - p1
-            obj.C1 = CFrame.new(p1 * scaleFactor) * r1
+            obj.C0 = CFrame.new(obj.C0.Position * scaleFactor) * (obj.C0 - obj.C0.Position)
+            obj.C1 = CFrame.new(obj.C1.Position * scaleFactor) * (obj.C1 - obj.C1.Position)
         end
     end
-    scaledModels[model] = true
 end
 
--- Apply scaling if model matches an ID you've marked to keep enlarged
-local function applyScaleIfTracked(model)
-    if not isLikelyPetModel(model) then return false end
-    local id = getPetUniqueId(model)
-    if not id then return false end
-    if not enlargedPetIds[id] then return false end
-    -- Try to apply scaling (safe even if model is partially constructed)
-    scaleModelWithJoints(model, ENLARGE_SCALE)
-    debugPrint("applyScaleIfTracked ->", model:GetFullName(), "id:", id)
-    return true
+-- Get unique pet ID or fallback to name
+local function getPetUniqueId(petModel)
+    if not petModel then return nil end
+    return petModel:GetAttribute("PetID") or petModel:GetAttribute("OwnerUserId") or petModel.Name
 end
 
--- Try repeated attempts for models (some garden spawns finish loading after a delay)
-local function tryScaleRepeated(model, attempts, waitInterval)
-    attempts = attempts or 8
-    waitInterval = waitInterval or 0.35
-    spawn(function()
-        for i = 1, attempts do
-            if not model or not model.Parent then return end
-            applyScaleIfTracked(model)
-            task.wait(waitInterval)
-        end
-    end)
-end
-
--- When something appears anywhere in workspace, detect its model and try scale
-workspace.DescendantAdded:Connect(function(inst)
-    local model = modelFromInstance(inst)
-    if model and isLikelyPetModel(model) then
-        debugPrint("DescendantAdded detected model:", model:GetFullName())
-        tryScaleRepeated(model, 10, 0.4)
-    end
-end)
-
--- Also scan existing models on script load (in case pets are already placed)
-for _, inst in ipairs(workspace:GetDescendants()) do
-    local model = modelFromInstance(inst)
-    if model and isLikelyPetModel(model) then
-        tryScaleRepeated(model, 4, 0.25)
-    end
-end
-
--- Mark a pet ID to be persistent and immediately attempt to scale any matching models
-local function markPetAsEnlarged(petModel)
-    local id = getPetUniqueId(petModel)
+-- Track pet ID to keep it enlarged persistently
+local function markPetAsEnlarged(pet)
+    local id = getPetUniqueId(pet)
     if id then
         enlargedPetIds[id] = true
-        debugPrint("Marked ID enlarged:", id)
-        -- immediately try to find any existing models with that ID
-        for _, inst in ipairs(workspace:GetDescendants()) do
-            local m = modelFromInstance(inst)
-            if m and isLikelyPetModel(m) and getPetUniqueId(m) == id then
-                tryScaleRepeated(m, 6, 0.3)
-            end
+    end
+end
+
+-- When a pet is added to any pet container, auto enlarge if tracked
+local function onPetAdded(pet)
+    if not pet:IsA("Model") then return end
+    local id = getPetUniqueId(pet)
+    if id and enlargedPetIds[id] then
+        task.delay(0.1, function()
+            scaleModelWithJoints(pet, ENLARGE_SCALE)
+            print("[TOCHIPYRO] Re-applied enlargement to pet:", pet.Name or id)
+        end)
+    end
+end
+
+-- Connect listeners to all pet containers and enlarge existing ones
+for _, container in ipairs(petContainers) do
+    if container then
+        container.ChildAdded:Connect(onPetAdded)
+        for _, child in ipairs(container:GetChildren()) do
+            onPetAdded(child)
         end
     end
 end
 
--- Find held pet in character (best-effort)
+-- Find the currently held pet model in character (exclude humanoid models/tools)
 local function getHeldPet()
-    local char = LocalPlayer and LocalPlayer.Character
+    local char = LocalPlayer.Character
     if not char then return nil end
     for _, obj in ipairs(char:GetDescendants()) do
         if obj:IsA("Model") and obj:FindFirstChildWhichIsA("BasePart") and not obj:FindFirstChildOfClass("Humanoid") then
             return obj
         end
     end
-    -- fallback: tools which might be pets
-    for _, tool in ipairs(char:GetChildren()) do
-        if tool:IsA("Tool") then
-            local m = modelFromInstance(tool)
-            if m and isLikelyPetModel(m) then return m end
-        end
-    end
     return nil
 end
 
--- Enlarge currently held pet and mark persistent
+-- Enlarge the currently held pet and mark it for persistent enlarge
 local function enlargeCurrentHeldPet()
     local pet = getHeldPet()
     if pet then
         scaleModelWithJoints(pet, ENLARGE_SCALE)
         markPetAsEnlarged(pet)
-        print("[TOCHIPYRO] Enlarged pet and marked persistent:", getPetUniqueId(pet))
+        print("[TOCHIPYRO] Enlarged pet:", pet.Name)
     else
-        warn("[TOCHIPYRO] No pet found to enlarge (hold the pet and try again).")
+        warn("[TOCHIPYRO] No pet found to enlarge.")
     end
 end
 
--- Optional continuous enforcement if the server keeps resetting sizes (slow)
-if CONTINUOUS_ENFORCE then
-    RunService.Heartbeat:Connect(function()
-        for model, _ in pairs(scaledModels) do
-            if model and model.Parent then
-                for _, obj in ipairs(model:GetDescendants()) do
-                    if obj:IsA("BasePart") then
-                        local orig = originalSizes[obj] or obj.Size
-                        obj.Size = orig * ENLARGE_SCALE
-                    elseif obj:IsA("SpecialMesh") then
-                        local orig = originalSizes[obj] or obj.Scale
-                        obj.Scale = orig * ENLARGE_SCALE
-                    end
-                end
-            end
-        end
-    end)
-end
+-- GUI Creation
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "TOCHIPYRO_Script"
+ScreenGui.Parent = game.CoreGui
 
--- GUI (same as before, hook SizeButton to enlargeCurrentHeldPet)
--- (You can keep your previous GUI creation and simply change the SizeButton handler:)
--- SizeButton.MouseButton1Click:Connect(enlargeCurrentHeldPet)
---
--- For convenience, if you don't use a GUI: uncomment the line below to bind a key:
--- game:GetService("UserInputService").InputBegan:Connect(function(input, processed)
---     if processed then return end
---     if input.KeyCode == Enum.KeyCode.G then enlargeCurrentHeldPet() end -- press G to mark held pet
--- end)
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 280, 0, 190)
+MainFrame.Position = UDim2.new(0.5, -140, 0.5, -95)
+MainFrame.BackgroundColor3 = Color3.new(0, 0, 0)
+MainFrame.BackgroundTransparency = 0.5
+MainFrame.BorderSizePixel = 0
+MainFrame.Parent = ScreenGui
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 45)
+Title.BackgroundTransparency = 1
+Title.Font = Enum.Font.GothamBold
+Title.Text = "TOCHIPYRO Script"
+Title.TextSize = 28
+Title.Parent = MainFrame
+
+task.spawn(function()
+    while Title and Title.Parent do
+        Title.TextColor3 = rainbowColor(0)
+        task.wait(0.1)
+    end
+end)
+
+local SizeButton = Instance.new("TextButton")
+SizeButton.Size = UDim2.new(1, -20, 0, 40)
+SizeButton.Position = UDim2.new(0, 10, 0, 55)
+SizeButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+SizeButton.TextColor3 = Color3.new(1, 1, 1)
+SizeButton.Text = "Size Enlarge"
+SizeButton.Font = Enum.Font.GothamBold
+SizeButton.TextScaled = true
+SizeButton.Parent = MainFrame
+
+local MoreButton = Instance.new("TextButton")
+MoreButton.Size = UDim2.new(1, -20, 0, 40)
+MoreButton.Position = UDim2.new(0, 10, 0, 105)
+MoreButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+MoreButton.TextColor3 = Color3.new(1, 1, 1)
+MoreButton.Text = "More"
+MoreButton.Font = Enum.Font.GothamBold
+MoreButton.TextScaled = true
+MoreButton.Parent = MainFrame
+
+local MoreFrame = Instance.new("Frame")
+MoreFrame.Size = UDim2.new(0, 210, 0, 150)
+MoreFrame.Position = UDim2.new(0.5, -105, 0.5, -75)
+MoreFrame.BackgroundColor3 = Color3.fromRGB(128, 0, 128)
+MoreFrame.BackgroundTransparency = 0.5
+MoreFrame.Visible = false
+MoreFrame.Parent = ScreenGui
+
+local UIStroke = Instance.new("UIStroke")
+UIStroke.Thickness = 2
+UIStroke.Color = Color3.fromRGB(200, 0, 200)
+UIStroke.Parent = MoreFrame
+
+local BypassButton = Instance.new("TextButton")
+BypassButton.Size = UDim2.new(1, -20, 0, 40)
+BypassButton.Position = UDim2.new(0, 10, 0, 10)
+BypassButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+BypassButton.TextColor3 = Color3.new(1, 1, 1)
+BypassButton.Text = "Bypass"
+BypassButton.Font = Enum.Font.GothamBold
+BypassButton.TextScaled = true
+BypassButton.Parent = MoreFrame
+
+local CloseButton = Instance.new("TextButton")
+CloseButton.Size = UDim2.new(1, -20, 0, 40)
+CloseButton.Position = UDim2.new(0, 10, 0, 65)
+CloseButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+CloseButton.TextColor3 = Color3.new(1, 1, 1)
+CloseButton.Text = "Close UI"
+CloseButton.Font = Enum.Font.GothamBold
+CloseButton.TextScaled = true
+CloseButton.Parent = MoreFrame
+
+-- Button Events
+SizeButton.MouseButton1Click:Connect(enlargeCurrentHeldPet)
+
+MoreButton.MouseButton1Click:Connect(function()
+    MoreFrame.Visible = not MoreFrame.Visible
+end)
+
+CloseButton.MouseButton1Click:Connect(function()
+    ScreenGui:Destroy()
+end)
+
+BypassButton.MouseButton1Click:Connect(function()
+    print("[TOCHIPYRO] Bypass pressed (placeholder).")
+end)
