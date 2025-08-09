@@ -1,5 +1,4 @@
--- TOCHIPYRO Script (Grow a Garden) with improved visibility and persistence
-
+-- TOCHIPYRO Enhanced (client-side)
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 local workspace = game:GetService("Workspace")
@@ -8,48 +7,61 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local ENLARGE_SCALE = 1.75
 
--- Containers to monitor for pet spawns
 local petContainers = {
     workspace,
     workspace:FindFirstChild("Pets"),
     workspace:FindFirstChild("PetSlots"),
-    workspace:FindFirstChild("GardenSlots"), -- Added garden slots
+    workspace:FindFirstChild("GardenSlots"),
 }
 
-local enlargedPetIds = {}
-local petConnections = {}
+local enlargedPetIds = {}         -- exact ids (preferred)
+local enlargedPetNames = {}       -- fallback by name
+local fingerprintMap = {}         -- fallback by mesh fingerprint
 local petUpdateLoops = {}
 
--- Rainbow color helper
-local function rainbowColor(t)
-    local hue = (tick() * 0.5 + t) % 1
-    return Color3.fromHSV(hue, 1, 1)
+-- small helper: build a simple fingerprint from SpecialMesh MeshId/TextureId
+local function getFingerprint(model)
+    local parts = {}
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("SpecialMesh") then
+            parts[#parts+1] = tostring(d.MeshId or "") .. "|" .. tostring(d.TextureId or "")
+        end
+    end
+    table.sort(parts)
+    return table.concat(parts, ";")
 end
 
--- Enhanced scaling function with better joint handling
+-- same as your getPetUniqueId but slightly more defensive
+local function getPetUniqueId(petModel)
+    if not petModel then return nil end
+    local id = petModel:GetAttribute("PetID")
+            or petModel:GetAttribute("UniqueID")
+            or petModel:GetAttribute("PetGUID")
+            or petModel:GetAttribute("OwnerUserId")
+    if id then return tostring(id) end
+    local owner = petModel:GetAttribute("Owner") or LocalPlayer.Name
+    return petModel.Name .. "_" .. tostring(owner)
+end
+
+-- scale function (kept your behavior, only added safety)
 local function scaleModelWithJoints(model, scaleFactor)
     if not model or not model.Parent then return end
-    
-    -- Scale all parts and meshes
+
     for _, obj in ipairs(model:GetDescendants()) do
         if obj:IsA("BasePart") then
             obj.Size = obj.Size * scaleFactor
-            -- Force network ownership for better replication
             if obj.CanSetNetworkOwnership then
-                pcall(function()
-                    obj:SetNetworkOwner(LocalPlayer)
-                end)
+                pcall(function() obj:SetNetworkOwner(LocalPlayer) end)
             end
         elseif obj:IsA("SpecialMesh") then
             obj.Scale = obj.Scale * scaleFactor
         elseif obj:IsA("Decal") or obj:IsA("Texture") then
-            -- Preserve texture scaling
             if obj.StudsPerTileU then
                 obj.StudsPerTileU = obj.StudsPerTileU * scaleFactor
                 obj.StudsPerTileV = obj.StudsPerTileV * scaleFactor
             end
         elseif obj:IsA("Motor6D") or obj:IsA("Weld") or obj:IsA("WeldConstraint") then
-            -- Better joint scaling
+            -- keep your existing joint-handling (avoid risky changes)
             if obj:IsA("Motor6D") then
                 local c0Pos = obj.C0.Position * scaleFactor
                 local c1Pos = obj.C1.Position * scaleFactor
@@ -63,102 +75,103 @@ local function scaleModelWithJoints(model, scaleFactor)
             end
         end
     end
-    
-    -- Mark the model as enlarged
+
     model:SetAttribute("TOCHIPYRO_Enlarged", true)
     model:SetAttribute("TOCHIPYRO_Scale", scaleFactor)
 end
 
--- Get unique pet ID with better fallbacks
-local function getPetUniqueId(petModel)
-    if not petModel then return nil end
-    
-    -- Try multiple attribute methods
-    local id = petModel:GetAttribute("PetID") or 
-               petModel:GetAttribute("UniqueID") or
-               petModel:GetAttribute("OwnerUserId") or
-               petModel:GetAttribute("PetGUID")
-    
-    if id then return tostring(id) end
-    
-    -- Fallback to name + some unique identifier
-    local owner = petModel:GetAttribute("Owner") or LocalPlayer.Name
-    return petModel.Name .. "_" .. owner
+-- helper to apply scaling multiple times (to survive quick server rewrites)
+local function reapplyEnlargeTo(pet)
+    if not pet then return end
+    -- try several times with small delays
+    for i = 1, 6 do
+        task.delay(0.05 * i, function()
+            if pet and pet.Parent then
+                pcall(function()
+                    scaleModelWithJoints(pet, ENLARGE_SCALE)
+                end)
+            end
+        end)
+    end
 end
 
--- Track pet ID to keep it enlarged persistently
 local function markPetAsEnlarged(pet)
     local id = getPetUniqueId(pet)
     if id then
         enlargedPetIds[id] = true
-        print("[TOCHIPYRO] Marked pet for persistent enlargement:", id)
     end
+    enlargedPetNames[pet.Name] = true
+    local fp = getFingerprint(pet)
+    if fp ~= "" then fingerprintMap[fp] = true end
+    pet:SetAttribute("TOCHIPYRO_EnlargedWanted", true) -- mark local model
+    print("[TOCHIPYRO] Marked:", pet.Name, "id:", id, "fp:", #fp>0 and fp or "none")
 end
 
--- Continuous monitoring function for each pet
+-- monitoring loop (keeps a pet enlarged if it loses attribute)
 local function startPetMonitoring(pet)
     local id = getPetUniqueId(pet)
     if not id then return end
-    
-    -- Stop existing monitoring for this pet
+
     if petUpdateLoops[id] then
         petUpdateLoops[id]:Disconnect()
     end
-    
-    -- Start new monitoring loop
+
     petUpdateLoops[id] = RunService.Heartbeat:Connect(function()
         if not pet or not pet.Parent then
-            petUpdateLoops[id]:Disconnect()
-            petUpdateLoops[id] = nil
+            if petUpdateLoops[id] then petUpdateLoops[id]:Disconnect() petUpdateLoops[id] = nil end
             return
         end
-        
-        -- Check if pet needs re-enlargement
-        if enlargedPetIds[id] and not pet:GetAttribute("TOCHIPYRO_Enlarged") then
-            task.wait(0.1) -- Small delay to ensure stability
-            scaleModelWithJoints(pet, ENLARGE_SCALE)
-            print("[TOCHIPYRO] Re-applied enlargement to pet:", pet.Name)
+
+        -- If we want it enlarged but attribute missing, reapply
+        if (enlargedPetIds[id] or enlargedPetNames[pet.Name]) and not pet:GetAttribute("TOCHIPYRO_Enlarged") then
+            reapplyEnlargeTo(pet)
+            print("[TOCHIPYRO] Re-applied enlargement to:", pet.Name)
         end
     end)
 end
 
--- Enhanced pet detection with better monitoring
+-- onPetAdded: called when a model appears in monitored containers
 local function onPetAdded(pet)
-    if not pet:IsA("Model") then return end
-    
-    -- Wait a moment for the pet to fully load
-    task.wait(0.2)
-    
+    if not pet or not pet:IsA("Model") then return end
+    task.wait(0.05)
     local id = getPetUniqueId(pet)
-    if not id then return end
-    
-    -- Start monitoring this pet
-    startPetMonitoring(pet)
-    
-    -- If this pet should be enlarged, do it
-    if enlargedPetIds[id] then
-        task.wait(0.1)
-        scaleModelWithJoints(pet, ENLARGE_SCALE)
-        print("[TOCHIPYRO] Auto-enlarged pet on spawn:", pet.Name)
+    local fp = getFingerprint(pet)
+
+    -- direct match
+    if id and enlargedPetIds[id] then
+        reapplyEnlargeTo(pet)
+        startPetMonitoring(pet)
+        print("[TOCHIPYRO] Auto-enlarged by ID:", pet.Name, id)
+        return
     end
-    
-    -- Monitor for when pet gets removed/moved
-    pet.AncestryChanged:Connect(function()
-        if pet.Parent then
-            -- Pet moved to new container, re-monitor
-            task.wait(0.1)
-            if enlargedPetIds[id] then
-                scaleModelWithJoints(pet, ENLARGE_SCALE)
-            end
+
+    -- fingerprint match
+    if fp ~= "" and fingerprintMap[fp] then
+        reapplyEnlargeTo(pet)
+        startPetMonitoring(pet)
+        print("[TOCHIPYRO] Auto-enlarged by fingerprint:", pet.Name)
+        return
+    end
+
+    -- name fallback (check owner if possible)
+    if enlargedPetNames[pet.Name] then
+        local owner = pet:GetAttribute("Owner") or pet:GetAttribute("OwnerUserId")
+        if not owner or tostring(owner) == tostring(LocalPlayer.Name) or tostring(owner) == tostring(LocalPlayer.UserId) then
+            reapplyEnlargeTo(pet)
+            startPetMonitoring(pet)
+            print("[TOCHIPYRO] Auto-enlarged by name fallback:", pet.Name)
+            return
         end
-    end)
+    end
 end
 
--- Enhanced container monitoring
+-- setup container monitoring (covers GardenSlots and nested slot children)
 local function setupContainerMonitoring()
     for _, container in ipairs(petContainers) do
         if container then
-            container.ChildAdded:Connect(onPetAdded)
+            container.ChildAdded:Connect(function(child)
+                onPetAdded(child)
+            end)
             container.DescendantAdded:Connect(function(descendant)
                 if descendant:IsA("Model") and descendant:FindFirstChildWhichIsA("BasePart") then
                     onPetAdded(descendant)
@@ -166,41 +179,34 @@ local function setupContainerMonitoring()
             end)
         end
     end
-    
-    -- Also monitor player's character for pet equipping
+
+    -- monitor player character too
     local function setupCharacterMonitoring()
         if LocalPlayer.Character then
             LocalPlayer.Character.ChildAdded:Connect(onPetAdded)
-            LocalPlayer.Character.DescendantAdded:Connect(function(descendant)
-                if descendant:IsA("Model") and descendant:FindFirstChildWhichIsA("BasePart") then
-                    onPetAdded(descendant)
+            LocalPlayer.Character.DescendantAdded:Connect(function(desc)
+                if desc:IsA("Model") and desc:FindFirstChildWhichIsA("BasePart") then
+                    onPetAdded(desc)
                 end
             end)
         end
     end
-    
     LocalPlayer.CharacterAdded:Connect(setupCharacterMonitoring)
-    if LocalPlayer.Character then
-        setupCharacterMonitoring()
-    end
+    if LocalPlayer.Character then setupCharacterMonitoring() end
 end
 
--- Setup container monitoring
+-- run it
 setupContainerMonitoring()
 
--- Find the currently held/equipped pet model
+-- helper to find currently held pet (keeps your original logic)
 local function getHeldPet()
     local char = LocalPlayer.Character
     if not char then return nil end
-    
-    -- Check character for pet models
     for _, obj in ipairs(char:GetDescendants()) do
         if obj:IsA("Model") and obj:FindFirstChildWhichIsA("BasePart") and not obj:FindFirstChildOfClass("Humanoid") and obj ~= char then
             return obj
         end
     end
-    
-    -- Check garden slots if available
     local gardenSlots = workspace:FindFirstChild("GardenSlots")
     if gardenSlots then
         for _, slot in ipairs(gardenSlots:GetChildren()) do
@@ -211,76 +217,30 @@ local function getHeldPet()
             end
         end
     end
-    
     return nil
 end
--- Monitor garden slots for pet placement
-local function setupGardenMonitoring()
-    local gardenSlots = workspace:FindFirstChild("GardenSlots")
-    if not gardenSlots then return end
 
-    gardenSlots.DescendantAdded:Connect(function(descendant)
-        if descendant:IsA("Model") and descendant:FindFirstChildWhichIsA("BasePart") then
-            local id = getPetUniqueId(descendant)
-            if id and enlargedPetIds[id] then
-                task.wait(0.1) -- small delay so the model is fully loaded
-                scaleModelWithJoints(descendant, ENLARGE_SCALE)
-                print("[TOCHIPYRO] Re-enlarged pet in GardenSlot:", descendant.Name)
-            end
-        end
-    end)
-end
-
--- Call it after all container monitoring is set up
-setupGardenMonitoring()
-
--- Enhanced enlargement function
+-- enlargeCurrentHeldPet (also stores fingerprints)
 local function enlargeCurrentHeldPet()
     local pet = getHeldPet()
     if pet then
         scaleModelWithJoints(pet, ENLARGE_SCALE)
         markPetAsEnlarged(pet)
         startPetMonitoring(pet)
-        
-        -- Force a small position change to trigger replication
+        -- force small movement to encourage replication
         if pet.PrimaryPart then
             local originalCFrame = pet.PrimaryPart.CFrame
             pet.PrimaryPart.CFrame = originalCFrame + Vector3.new(0, 0.01, 0)
-            task.wait(0.1)
+            task.wait(0.08)
             pet.PrimaryPart.CFrame = originalCFrame
         end
-        
-        print("[TOCHIPYRO] Enlarged pet:", pet.Name)
+        print("[TOCHIPYRO] Enlarged pet (manual):", pet.Name)
     else
-        -- Try to find pets in other locations
-        local foundPet = false
-        for _, container in ipairs(petContainers) do
-            if container then
-                for _, obj in ipairs(container:GetDescendants()) do
-                    if obj:IsA("Model") and obj:FindFirstChildWhichIsA("BasePart") and not obj:FindFirstChildOfClass("Humanoid") then
-                        local owner = obj:GetAttribute("Owner") or obj:GetAttribute("OwnerUserId")
-                        if owner == LocalPlayer.Name or owner == LocalPlayer.UserId then
-                            scaleModelWithJoints(obj, ENLARGE_SCALE)
-                            markPetAsEnlarged(obj)
-                            startPetMonitoring(obj)
-                            print("[TOCHIPYRO] Found and enlarged pet:", obj.Name)
-                            foundPet = true
-                            break
-                        end
-                    end
-                end
-                if foundPet then break end
-            end
-        end
-        
-        if not foundPet then
-            warn("[TOCHIPYRO] No pet found to enlarge. Make sure you have a pet equipped or in your garden.")
-        end
+        warn("[TOCHIPYRO] No pet found to enlarge.")
     end
 end
 
--- GUI Creation (keeping original design)
-
+-- GUI (your GUI code — keep same)
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "TOCHIPYRO_Script"
 ScreenGui.Parent = game.CoreGui
@@ -303,7 +263,7 @@ Title.Parent = MainFrame
 
 task.spawn(function()
     while Title and Title.Parent do
-        Title.TextColor3 = rainbowColor(0)
+        Title.TextColor3 = Color3.fromHSV((tick() * 0.5) % 1, 1, 1)
         task.wait(0.1)
     end
 end)
@@ -328,6 +288,7 @@ MoreButton.Font = Enum.Font.GothamBold
 MoreButton.TextScaled = true
 MoreButton.Parent = MainFrame
 
+-- More frame elements...
 local MoreFrame = Instance.new("Frame")
 MoreFrame.Size = UDim2.new(0, 210, 0, 150)
 MoreFrame.Position = UDim2.new(0.5, -105, 0.5, -75)
@@ -361,23 +322,16 @@ CloseButton.Font = Enum.Font.GothamBold
 CloseButton.TextScaled = true
 CloseButton.Parent = MoreFrame
 
--- Button Events
 SizeButton.MouseButton1Click:Connect(enlargeCurrentHeldPet)
-
-MoreButton.MouseButton1Click:Connect(function()
-    MoreFrame.Visible = not MoreFrame.Visible
-end)
-
+MoreButton.MouseButton1Click:Connect(function() MoreFrame.Visible = not MoreFrame.Visible end)
 CloseButton.MouseButton1Click:Connect(function()
-    -- Clean up monitoring loops
     for id, connection in pairs(petUpdateLoops) do
         connection:Disconnect()
     end
     ScreenGui:Destroy()
 end)
-
 BypassButton.MouseButton1Click:Connect(function()
     print("[TOCHIPYRO] Bypass pressed (placeholder).")
 end)
 
-print("[TOCHIPYRO] Enhanced pet enlarger loaded with improved visibility and persistence!")
+print("[TOCHIPYRO] Enhanced pet enlarger loaded — check Output for debug messages.")
