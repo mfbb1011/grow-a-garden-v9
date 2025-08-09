@@ -12,11 +12,10 @@ local petContainers = {
     workspace,
     workspace:FindFirstChild("Pets"),
     workspace:FindFirstChild("PetSlots"),
-    workspace:FindFirstChild("GardenSlot"), -- ✅ Add Garden Slot
-    workspace:FindFirstChild("GardenSlots"), -- ✅ In case it's plural
     LocalPlayer.Character,
     LocalPlayer:FindFirstChild("Backpack"),
 }
+
 local enlargedPetIds = {}
 
 -- Rainbow color helper
@@ -69,9 +68,6 @@ end
 for _, container in ipairs(petContainers) do
     if container then
         container.ChildAdded:Connect(onPetAdded)
-        for _, child in ipairs(container:GetChildren()) do
-            onPetAdded(child) -- enlarge existing pets too
-        end
     end
 end
 
@@ -195,5 +191,3 @@ end)
 BypassButton.MouseButton1Click:Connect(function()
     print("[TOCHIPYRO] Bypass pressed (placeholder).")
 end)
-
-
