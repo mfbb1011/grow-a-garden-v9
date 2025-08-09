@@ -1,17 +1,25 @@
--- TOCHIPYRO — improved persistent pet enlargement (more robust for gardens)
+-- TOCHIPYRO Script (Grow a Garden) with persistent pet enlargement in plots
+
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 local workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
 
 local ENLARGE_SCALE = 1.75
-local ENFORCE_INTERVAL = 1 -- seconds
 
--- stored fingerprints of pets you asked to enlarge
-local enlargedFingerprints = {} -- array of fingerprint tables
+-- Containers to monitor for pet spawns (added garden plot holders)
+local petContainers = {
+    workspace,
+    workspace:FindFirstChild("Pets"),
+    workspace:FindFirstChild("PetSlots"),
+    workspace:FindFirstChild("GardenPlots"), -- For garden plot pets
+    workspace:FindFirstChild("Plots"),       -- Alternative name
+    workspace:FindFirstChild("FarmPets"),    -- Alternative name
+    LocalPlayer.Character,
+    LocalPlayer:FindFirstChild("Backpack"),
+}
 
--- active tracked pet instances -> data
-local trackedPets = {} -- [Model] = {originalSizes = {}, originalMeshScales = {}, originalC0s = {}, originalC1s = {}, fingerprint = fp, alive = true}
+local enlargedPetIds = {}
 
 -- Rainbow color helper
 local function rainbowColor(t)
@@ -19,238 +27,54 @@ local function rainbowColor(t)
     return Color3.fromHSV(hue, 1, 1)
 end
 
--- safe helper to get mesh id string
-local function meshIdOf(obj)
-    if obj:IsA("SpecialMesh") then
-        return tostring(obj.MeshId or "")
-    elseif obj:IsA("MeshPart") then
-        return tostring(obj.MeshId or "")
-    end
-    return ""
-end
-
--- fingerprint builder: id, name, and a small set of meshIds
-local function buildFingerprint(model)
-    if not model then return nil end
-    local id = model:GetAttribute("PetID") or model:GetAttribute("OwnerUserId") or model.Name
-    local name = model.Name
-    local meshIds = {}
-    for _, d in ipairs(model:GetDescendants()) do
-        if d:IsA("SpecialMesh") or d:IsA("MeshPart") then
-            local mid = meshIdOf(d)
-            if mid ~= "" then
-                meshIds[mid] = true
-            end
-        end
-    end
-    -- convert to list
-    local list = {}
-    for k,_ in pairs(meshIds) do table.insert(list, k) end
-    return {id = id, name = name, meshes = list}
-end
-
--- heuristic match (id match preferred; otherwise name or any mesh overlap)
-local function fingerprintMatches(a, b)
-    if not a or not b then return false end
-    if a.id and b.id and a.id == b.id then return true end
-    if a.name and b.name and a.name == b.name then return true end
-    -- mesh overlap
-    local set = {}
-    for _,m in ipairs(a.meshes or {}) do set[m] = true end
-    for _,m in ipairs(b.meshes or {}) do
-        if set[m] then return true end
-    end
-    return false
-end
-
--- scale model by using stored originals (so we don't compound scaling)
-local function applyScaleUsingOriginals(model, data, scale)
-    if not model or not data then return end
-    -- BaseParts
-    for part, origSize in pairs(data.originalSizes) do
-        if part and part.Parent then
-            pcall(function() part.Size = origSize * scale end)
-        end
-    end
-    -- SpecialMesh / MeshPart scales
-    for mesh, origScale in pairs(data.originalMeshScales) do
-        if mesh and mesh.Parent then
-            pcall(function() mesh.Scale = origScale * scale end)
-        end
-    end
-    -- Motor6D C0/C1 (use originally captured CFrames)
-    for mot, origC0 in pairs(data.originalC0s) do
-        if mot and mot.Parent then
-            pcall(function()
-                mot.C0 = CFrame.new(origC0.Position * scale) * (origC0 - origC0.Position)
-            end)
-        end
-    end
-    for mot, origC1 in pairs(data.originalC1s) do
-        if mot and mot.Parent then
-            pcall(function()
-                mot.C1 = CFrame.new(origC1.Position * scale) * (origC1 - origC1.Position)
-            end)
-        end
-    end
-end
-
--- capture originals for a new tracked pet and immediately apply scale
-local function trackAndEnlargeInstance(model, fingerprint)
-    if not model or trackedPets[model] then return end
-    local data = {
-        originalSizes = {},
-        originalMeshScales = {},
-        originalC0s = {},
-        originalC1s = {},
-        fingerprint = fingerprint,
-        alive = true,
-    }
-
-    -- capture & set
+-- Scale model parts & joints preserving proportions
+local function scaleModelWithJoints(model, scaleFactor)
     for _, obj in ipairs(model:GetDescendants()) do
         if obj:IsA("BasePart") then
-            data.originalSizes[obj] = obj.Size
+            obj.Size = obj.Size * scaleFactor
         elseif obj:IsA("SpecialMesh") then
-            data.originalMeshScales[obj] = obj.Scale
-        elseif obj:IsA("MeshPart") then
-            -- MeshPart scale is handled as BasePart.Size (MeshPart.Scale property does not exist)
-            if not data.originalSizes[obj] then
-                data.originalSizes[obj] = obj.Size
-            end
+            obj.Scale = obj.Scale * scaleFactor
         elseif obj:IsA("Motor6D") then
-            data.originalC0s[obj] = obj.C0
-            data.originalC1s[obj] = obj.C1
+            obj.C0 = CFrame.new(obj.C0.Position * scaleFactor) * (obj.C0 - obj.C0.Position)
+            obj.C1 = CFrame.new(obj.C1.Position * scaleFactor) * (obj.C1 - obj.C1.Position)
         end
     end
+end
 
-    -- store
-    trackedPets[model] = data
+-- Get unique pet ID or fallback to name
+local function getPetUniqueId(petModel)
+    if not petModel then return nil end
+    return petModel:GetAttribute("PetID") or petModel:GetAttribute("OwnerUserId") or petModel.Name
+end
 
-    -- mark attribute on model to help quick detection if the same instance moves
-    pcall(function() model:SetAttribute("TOCHIPYRO_Enlarged", true) end)
+-- Track pet ID to keep it enlarged persistently
+local function markPetAsEnlarged(pet)
+    local id = getPetUniqueId(pet)
+    if id then
+        enlargedPetIds[id] = true
+    end
+end
 
-    -- apply scale once now using originals (so we don't compound)
-    applyScaleUsingOriginals(model, data, ENLARGE_SCALE)
-    print("[TOCHIPYRO] Applied enlargement to instance:", model.Name)
-
-    -- reapply on parent changes (so when moved into garden we re-apply)
-    local ancestryConn
-    ancestryConn = model.AncestryChanged:Connect(function(child, parent)
-        if not trackedPets[model] then
-            if ancestryConn then ancestryConn:Disconnect() end
-            return
-        end
-        -- small delay for replication
-        task.delay(0.07, function()
-            if trackedPets[model] then
-                applyScaleUsingOriginals(model, trackedPets[model], ENLARGE_SCALE)
-                print("[TOCHIPYRO] Re-applied enlargement after AncestryChanged:", model.Name)
-            end
+-- When a pet is added to any pet container, auto enlarge if tracked
+local function onPetAdded(pet)
+    if not pet:IsA("Model") then return end
+    local id = getPetUniqueId(pet)
+    if id and enlargedPetIds[id] then
+        task.delay(0.5, function() -- increased delay for garden pets to fully load
+            scaleModelWithJoints(pet, ENLARGE_SCALE)
+            print("[TOCHIPYRO] Re-applied enlargement to pet:", pet.Name or id)
         end)
-    end)
-
-    -- enforcement loop — keeps sizes set in case server/client scripts reset them
-    task.spawn(function()
-        while trackedPets[model] and model.Parent and trackedPets[model].alive do
-            applyScaleUsingOriginals(model, trackedPets[model], ENLARGE_SCALE)
-            task.wait(ENFORCE_INTERVAL)
-        end
-        -- cleanup
-        trackedPets[model] = nil
-    end)
-end
-
--- try to auto-enlarge a model if it matches any fingerprint we saved
-local function tryAutoEnlarge(model)
-    if not model or not model:IsA("Model") then return end
-    -- quick check: if it already has our attribute, re-apply
-    if model:GetAttribute("TOCHIPYRO_Enlarged") then
-        local fp = buildFingerprint(model)
-        trackAndEnlargeInstance(model, fp)
-        return
-    end
-    -- check against saved fingerprints
-    local modelFp = buildFingerprint(model)
-    if not modelFp then return end
-    for _, savedFp in ipairs(enlargedFingerprints) do
-        if fingerprintMatches(savedFp, modelFp) then
-            -- found a match; enlarge this instance
-            trackAndEnlargeInstance(model, savedFp)
-            return
-        end
     end
 end
 
--- on child added (for specific containers)
-local function onPetAdded(child)
-    -- model only
-    if not child or not child:IsA("Model") then return end
-    -- small delay for the model to finish replicating/initializing
-    task.delay(0.05, function()
-        tryAutoEnlarge(child)
-    end)
-end
-
--- scan workspace for likely garden/plot folders and other containers
-local function findPetContainers()
-    local containers = {
-        workspace,
-        workspace:FindFirstChild("Pets"),
-        workspace:FindFirstChild("PetSlots"),
-        LocalPlayer.Character,
-        LocalPlayer:FindFirstChild("Backpack"),
-    }
-
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Folder") or obj:IsA("Model") then
-            local nameLower = string.lower(obj.Name)
-            if nameLower:find("garden") or nameLower:find("plot") or nameLower:find("pet") then
-                table.insert(containers, obj)
-            end
-        end
-    end
-
-    -- dedupe
-    local seen = {}
-    local out = {}
-    for _, c in ipairs(containers) do
-        if c and not seen[c] then
-            seen[c] = true
-            table.insert(out, c)
-        end
-    end
-    return out
-end
-
--- watch containers
-local function connectAllContainers()
-    local petContainers = findPetContainers()
-    for _, container in ipairs(petContainers) do
-        if container and container.ChildAdded then
-            container.ChildAdded:Connect(onPetAdded)
-        end
+-- Connect listeners to all pet containers
+for _, container in ipairs(petContainers) do
+    if container then
+        container.ChildAdded:Connect(onPetAdded)
     end
 end
 
--- also watch workspace.DescendantAdded to catch creations anywhere
-workspace.DescendantAdded:Connect(function(desc)
-    if desc:IsA("Model") then
-        task.delay(0.03, function() tryAutoEnlarge(desc) end)
-    end
-end)
-
--- initial pass: try existing models in workspace
-for _, d in ipairs(workspace:GetDescendants()) do
-    if d:IsA("Model") then
-        tryAutoEnlarge(d)
-    end
-end
-
--- connect containers initially (and you can call this again if you want to refresh)
-connectAllContainers()
-
--- Held pet detection (same as before)
+-- Find the currently held pet model in character (exclude humanoid models/tools)
 local function getHeldPet()
     local char = LocalPlayer.Character
     if not char then return nil end
@@ -262,29 +86,20 @@ local function getHeldPet()
     return nil
 end
 
--- enlarge the currently held pet, store its fingerprint, and start tracking
+-- Enlarge the currently held pet and mark it for persistent enlarge
 local function enlargeCurrentHeldPet()
     local pet = getHeldPet()
     if pet then
-        local fp = buildFingerprint(pet) or { id = pet.Name, name = pet.Name, meshes = {} }
-        -- store fingerprint (if not already stored)
-        local already = false
-        for _, v in ipairs(enlargedFingerprints) do
-            if fingerprintMatches(v, fp) then already = true break end
-        end
-        if not already then
-            table.insert(enlargedFingerprints, fp)
-        end
-
-        -- track and enlarge this instance now
-        trackAndEnlargeInstance(pet, fp)
-        print("[TOCHIPYRO] Enlarged pet and saved fingerprint:", pet.Name)
+        scaleModelWithJoints(pet, ENLARGE_SCALE)
+        markPetAsEnlarged(pet)
+        print("[TOCHIPYRO] Enlarged pet:", pet.Name)
     else
         warn("[TOCHIPYRO] No pet found to enlarge.")
     end
 end
 
--- GUI Creation (kept same as your UI)
+-- GUI Creation
+
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "TOCHIPYRO_Script"
 ScreenGui.Parent = game.CoreGui
