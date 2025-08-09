@@ -1,4 +1,4 @@
--- TOCHIPYRO Enhanced Pet Enlarger with Gradual Weight Growth (Grow a Garden)
+-- TOCHIPYRO Enhanced Pet Enlarger + Hotbar KG Update for Grow a Garden
 
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
@@ -7,13 +7,11 @@ local workspace = game:GetService("Workspace")
 
 local ENLARGE_SCALE = 1.75
 local WEIGHT_MULTIPLIER = 2.5
-local GROW_SPEED = 0.5 -- weight increase per step (in KG)
-local GROW_INTERVAL = 0.5 -- seconds between weight increases
 
--- Store pet IDs enlarged
 local enlargedPetIds = {}
 local petUpdateLoops = {}
 local originalWeights = {}
+local hotbarUpdateLoop = nil
 
 -- Deep find Weight NumberValue inside pet model
 local function findWeightNumberValue(model)
@@ -25,13 +23,13 @@ local function findWeightNumberValue(model)
     return nil
 end
 
--- Get unique pet ID fallback function
+-- Get unique pet ID
 local function getPetUniqueId(petModel)
     if not petModel then return nil end
     return petModel:GetAttribute("PetID") or petModel:GetAttribute("OwnerUserId") or petModel.Name
 end
 
--- Scale pet parts and joints properly
+-- Scale model with joints
 local function scaleModelWithJoints(model, scaleFactor)
     for _, obj in ipairs(model:GetDescendants()) do
         if obj:IsA("BasePart") then
@@ -47,33 +45,61 @@ local function scaleModelWithJoints(model, scaleFactor)
     model:SetAttribute("TOCHIPYRO_Scale", scaleFactor)
 end
 
--- Gradually increase pet's weight to target
-local function growWeightOverTime(petModel, targetWeight)
-    local weightValue = findWeightNumberValue(petModel)
-    if not weightValue then return end
+-- Update Hotbar KG
+local function updateHotbarKG(newWeight)
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return end
+    local hotbar = playerGui:FindFirstChild("Hotbar") or playerGui:FindFirstChild("PetHotbar") or playerGui:FindFirstChildWhichIsA("ScreenGui")
+    if not hotbar then return end
 
-    task.spawn(function()
-        while petModel and petModel.Parent and weightValue.Value < targetWeight do
-            weightValue.Value = math.min(weightValue.Value + GROW_SPEED, targetWeight)
-            petModel:SetAttribute("Weight", weightValue.Value)
-            petModel:SetAttribute("weight", weightValue.Value)
-
-            -- Update any weight text in GUI
-            local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-            if playerGui then
-                for _, gui in ipairs(playerGui:GetDescendants()) do
-                    if (gui:IsA("TextLabel") or gui:IsA("TextBox")) and gui.Text:lower():find("kg") then
-                        gui.Text = string.gsub(gui.Text, "%d+%.?%d*", string.format("%.1f", weightValue.Value))
-                    end
-                end
-            end
-
-            task.wait(GROW_INTERVAL)
+    for _, gui in ipairs(hotbar:GetDescendants()) do
+        if gui:IsA("TextLabel") and gui.Text:lower():find("kg") then
+            gui.Text = string.format("%.1f KG", newWeight)
         end
+    end
+end
+
+-- Auto-refresh hotbar weight so it never reverts
+local function startHotbarLoop(newWeight)
+    if hotbarUpdateLoop then
+        hotbarUpdateLoop:Disconnect()
+        hotbarUpdateLoop = nil
+    end
+    hotbarUpdateLoop = RunService.Heartbeat:Connect(function()
+        updateHotbarKG(newWeight)
     end)
 end
 
--- Mark pet ID as enlarged for persistence
+-- Increase pet weight in the model and GUI
+local function increaseWeight(petModel)
+    local weightValue = findWeightNumberValue(petModel)
+    if not weightValue then
+        warn("[TOCHIPYRO] Could not find Weight NumberValue in pet:", petModel.Name)
+        return
+    end
+
+    local id = getPetUniqueId(petModel)
+    if not id then
+        warn("[TOCHIPYRO] Pet missing unique ID, skipping weight update")
+        return
+    end
+
+    if not originalWeights[id] then
+        originalWeights[id] = weightValue.Value
+    end
+
+    local newWeight = originalWeights[id] * WEIGHT_MULTIPLIER
+    weightValue.Value = newWeight
+    petModel:SetAttribute("Weight", newWeight)
+    petModel:SetAttribute("weight", newWeight)
+
+    print(string.format("[TOCHIPYRO] Weight updated from %.2f to %.2f for pet %s", originalWeights[id], newWeight, petModel.Name))
+
+    updateHotbarKG(newWeight)
+    startHotbarLoop(newWeight)
+end
+
+-- Mark pet ID as enlarged
 local function markPetAsEnlarged(petModel)
     local id = getPetUniqueId(petModel)
     if id then
@@ -81,16 +107,14 @@ local function markPetAsEnlarged(petModel)
     end
 end
 
--- Monitoring pet to reapply scale + weight when respawned or reequipped
+-- Monitor pet for persistence
 local function startPetMonitor(petModel)
     local id = getPetUniqueId(petModel)
     if not id then return end
-
     if petUpdateLoops[id] then
         petUpdateLoops[id]:Disconnect()
         petUpdateLoops[id] = nil
     end
-
     petUpdateLoops[id] = RunService.Heartbeat:Connect(function()
         if not petModel or not petModel.Parent then
             if petUpdateLoops[id] then
@@ -99,27 +123,23 @@ local function startPetMonitor(petModel)
             end
             return
         end
-
         if enlargedPetIds[id] and not petModel:GetAttribute("TOCHIPYRO_Enlarged") then
             scaleModelWithJoints(petModel, ENLARGE_SCALE)
-            local targetWeight = (originalWeights[id] or 1) * WEIGHT_MULTIPLIER
-            growWeightOverTime(petModel, targetWeight)
+            increaseWeight(petModel)
             print("[TOCHIPYRO] Reapplied enlargement to pet:", petModel.Name)
         end
     end)
 end
 
--- Find currently held pet (try character descendants & garden slots)
+-- Get held pet
 local function getHeldPet()
     local char = LocalPlayer.Character
     if not char then return nil end
-
     for _, obj in ipairs(char:GetDescendants()) do
         if obj:IsA("Model") and obj:FindFirstChildWhichIsA("BasePart") and not obj:FindFirstChildOfClass("Humanoid") and obj ~= char then
             return obj
         end
     end
-
     local gardenSlots = workspace:FindFirstChild("GardenSlots")
     if gardenSlots then
         for _, slot in ipairs(gardenSlots:GetChildren()) do
@@ -136,35 +156,21 @@ local function getHeldPet()
     return nil
 end
 
--- Enlarge current held pet (scale + gradual weight + persist)
+-- Enlarge current pet
 local function enlargeCurrentPet()
     local pet = getHeldPet()
     if not pet then
         warn("[TOCHIPYRO] No held pet found to enlarge!")
         return
     end
-
     scaleModelWithJoints(pet, ENLARGE_SCALE)
-
-    local weightValue = findWeightNumberValue(pet)
-    if weightValue then
-        local id = getPetUniqueId(pet)
-        if not originalWeights[id] then
-            originalWeights[id] = weightValue.Value
-        end
-        local targetWeight = originalWeights[id] * WEIGHT_MULTIPLIER
-        growWeightOverTime(pet, targetWeight)
-    else
-        warn("[TOCHIPYRO] Could not find Weight value!")
-    end
-
+    increaseWeight(pet)
     markPetAsEnlarged(pet)
     startPetMonitor(pet)
-
-    print("[TOCHIPYRO] Enlarged pet with gradual weight growth:", pet.Name)
+    print("[TOCHIPYRO] Enlarged pet:", pet.Name)
 end
 
--- Monitor pets added to workspace/garden/pet slots to auto-enlarge if previously marked
+-- Auto enlarge on spawn
 local function onPetAdded(pet)
     if not pet:IsA("Model") then return end
     task.wait(0.1)
@@ -173,26 +179,20 @@ local function onPetAdded(pet)
     startPetMonitor(pet)
     if enlargedPetIds[id] then
         scaleModelWithJoints(pet, ENLARGE_SCALE)
-        local targetWeight = (originalWeights[id] or 1) * WEIGHT_MULTIPLIER
-        growWeightOverTime(pet, targetWeight)
+        increaseWeight(pet)
         print("[TOCHIPYRO] Auto-enlarged pet on spawn:", pet.Name)
     end
 end
 
--- Connect pet add events on containers
-local petContainers = {
-    workspace,
-    workspace:FindFirstChild("Pets"),
-    workspace:FindFirstChild("PetSlots"),
-    workspace:FindFirstChild("GardenSlots"),
-}
+-- Connect to containers
+local petContainers = {workspace, workspace:FindFirstChild("Pets"), workspace:FindFirstChild("PetSlots"), workspace:FindFirstChild("GardenSlots")}
 for _, container in pairs(petContainers) do
     if container then
         container.ChildAdded:Connect(onPetAdded)
     end
 end
 
--- Character pet add monitoring
+-- Character monitoring
 local function setupCharacterMonitoring()
     if LocalPlayer.Character then
         LocalPlayer.Character.ChildAdded:Connect(onPetAdded)
@@ -236,11 +236,11 @@ SizeButton.Size = UDim2.new(1, -20, 0, 40)
 SizeButton.Position = UDim2.new(0, 10, 0, 50)
 SizeButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
 SizeButton.TextColor3 = Color3.new(1, 1, 1)
-SizeButton.Text = "Size Enlarge + Gradual Weight"
+SizeButton.Text = "Size Enlarge + Weight"
 SizeButton.Font = Enum.Font.GothamBold
 SizeButton.TextScaled = true
 SizeButton.Parent = MainFrame
 
 SizeButton.MouseButton1Click:Connect(enlargeCurrentPet)
 
-print("[TOCHIPYRO] Pet enlarger with gradual weight growth loaded!")
+print("[TOCHIPYRO] Pet enlarger with hotbar weight update loaded!")
